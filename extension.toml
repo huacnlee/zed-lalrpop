@@ -1,0 +1,11 @@
+id = "lalrpop"
+name = "LALRPOP"
+description = "LALRPOP parser grammar support."
+version = "0.0.1"
+schema_version = 1
+authors = ["Jason Lee <huacnlee@gmail.com>"]
+repository = "https://github.com/huacnlee/zed-lalrpop"
+
+[grammars.lalrpop]
+repository = "https://github.com/traxys/tree-sitter-lalrpop"
+commit = "123d8b472e949b59f348c32e245107a34a3d8945"

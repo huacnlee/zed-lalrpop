@@ -1,0 +1,636 @@
+use itertools::Itertools;
+
+use base::ast::{Alternative, Argument, Array, AstType, Do, Comment, Expr, ExprField, Lambda, Literal, Pattern,
+    PatternField, SpannedExpr, SpannedIdent, TypeBinding, TypedIdent, ValueBinding};
+use base::kind::{ArcKind, Kind};
+use base::pos::{self, BytePos, Spanned};
+use base::types::{AliasData, ArcType, ArgType, BuiltinType, Field, Generic, Type, TypeCache};
+use std::str::FromStr;
+
+use ::new_ident;
+use token::Token;
+use ordered_float::NotNaN;
+
+use {Error, ErrorEnv, FieldExpr, FieldPattern, MutIdentEnv};
+
+grammar<'input, 'env, Id>(src: &'input str, type_cache: &TypeCache<Id, ArcType<Id>>, env: MutIdentEnv<'env, Id>, errors: ErrorEnv<'env, 'input>)
+    where Id: Clone;
+
+extern {
+    type Location = BytePos;
+    type Error = Spanned<Error, BytePos>;
+
+    enum Token<'input> {
+        "shebang line" => Token::ShebangLine(<&'input str>),
+        "identifier" => Token::Identifier(<&'input str>),
+        "operator" => Token::Operator(<&'input str>),
+        "string literal" => Token::StringLiteral(<String>),
+        "char literal" => Token::CharLiteral(<char>),
+        "int literal" => Token::IntLiteral(<i64>),
+        "byte literal" => Token::ByteLiteral(<u8>),
+        "float literal" => Token::FloatLiteral(<f64>),
+        "documentation comment" => Token::DocComment(<Comment>),
+
+        "and" => Token::And,
+        "else" => Token::Else,
+        "forall" => Token::Forall,
+        "if" => Token::If,
+        "in" => Token::In,
+        "let" => Token::Let,
+        "do" => Token::Do,
+        "match" => Token::Match,
+        "then" => Token::Then,
+        "type" => Token::Type,
+        "with" => Token::With,
+
+        "@" => Token::At,
+        ":" => Token::Colon,
+        "," => Token::Comma,
+        "." => Token::Dot,
+        ".." => Token::DotDot,
+        "=" => Token::Equals,
+        "\\" => Token::Lambda,
+        "|" => Token::Pipe,
+        "->" => Token::RArrow,
+        "?" => Token::Question,
+
+        "{" => Token::LBrace,
+        "[" => Token::LBracket,
+        "(" => Token::LParen,
+
+        "}" => Token::RBrace,
+        "]" => Token::RBracket,
+        ")" => Token::RParen,
+
+        "block open" => Token::OpenBlock,
+        "block close" => Token::CloseBlock,
+        "block separator" => Token::Semi,
+    }
+}
+
+// Utils
+
+SingleComma: () = {
+    "," => (),
+    // Necessar
+    <!> => errors.push(<>.error)
+};
+
+Comma<Rule>: Vec<Rule> =
+    <rules: (<Rule> SingleComma)*> <last: Rule?> => {
+        let mut rules = rules;
+        rules.extend(last);
+        rules
+    };
+
+Sp<Rule>: Spanned<Rule, BytePos> =
+    <l: @L> <rule: Rule> <r: @R> =>
+        pos::spanned2(l, r, rule);
+
+IdentStr: &'input str = {
+    "identifier" => <>,
+    "(" <"operator"> ")" => <>,
+};
+
+SkipExtraTokens: () = {
+    => (),
+    <!> => errors.push(<>.error),
+};
+
+Ident: Id =
+    IdentStr => env.from_str(<>);
+
+SpannedIdent: SpannedIdent<Id> =
+    Sp<Ident> => pos::spanned(<>.span, new_ident(type_cache, <>.value));
+
+Operator: TypedIdent<Id> =
+    "operator" => new_ident(type_cache, env.from_str(<>));
+
+DocComment: Comment =
+    "documentation comment"+ => {
+        let typ = <>.last().unwrap().typ;
+        Comment {
+            typ: typ,
+            content: <>.into_iter().map(|comment| comment.content).join("\n")
+        }
+    };
+
+// Kinds
+
+AtomicKind: ArcKind = {
+    <l: @L> <id: "identifier"> <r: @R> =>? {
+        use lalrpop_util::ParseError;
+
+        match id {
+            "_" => Ok(Kind::hole()),
+            "Type" => Ok(Kind::typ()),
+            "Row" => Ok(Kind::row()),
+            id => Err(ParseError::User {
+                error: pos::spanned2(
+                    l.into(),
+                    r.into(),
+                    Error::UnexpectedToken(
+                        "identifier".to_string(),
+                        ["_", "Row", "Type"].iter().map(|s| s.to_string()).collect())),
+            }),
+        }
+    },
+
+    "(" <kind: Kind> ")" => kind,
+};
+
+Kind: ArcKind = {
+    AtomicKind,
+
+    <lhs: AtomicKind> "->" <rhs: Kind> =>
+        Kind::function(lhs, rhs),
+};
+
+// Types
+
+TypeParam: Generic<Id> = {
+    <id : Ident> =>
+        Generic::new(id, Kind::hole()),
+
+    "(" <id: Ident> ":" <kind: Kind> ")" =>
+        Generic::new(id, kind),
+};
+
+RecordField: Field<Id, AstType<Id>> =
+    <comment: DocComment?> <id: Ident> ":" <typ: Sp<Type_>> =>
+        Field::new(
+            id,
+            AstType::with_comment(comment, typ),
+        );
+
+VariantField: (Id, Vec<AstType<Id>>) =
+    "|" <Ident> <AtomicType*> => (<>);
+
+TypeBinding: TypeBinding<Id> = {
+    <id: Sp<Ident>> <params: TypeParam*> "=" <row: Sp<VariantField+>> => {
+        let typ_args = params.iter().cloned().map(Type::generic).collect();
+        let typ: AstType<Id> = Type::app(Type::ident(id.value.clone()), typ_args);
+
+        let row_span = row.span;
+        let row = row.value.into_iter()
+            .map(|(id, params)| Field::new(id, Type::function(params, typ.clone())))
+            .collect();
+
+        TypeBinding {
+            comment: None,
+            name: id.clone(),
+            alias: pos::spanned(
+                row_span,
+                AliasData::new(
+                    id.value.clone(),
+                    params,
+                    AstType::from(pos::spanned(
+                        row_span,
+                        Type::Variant(Type::extend_row(vec![], row, Type::empty_row()))
+                    )),
+                )
+            ),
+            finalized_alias: None,
+        }
+    },
+
+    <id: Sp<Ident>> <params: TypeParam*> "=" <body: Sp<Type>> => {
+        TypeBinding {
+            comment: None,
+            name: id.clone(),
+            alias: pos::spanned(body.span, AliasData::new(id.value.clone(), params, body.value)),
+            finalized_alias: None,
+        }
+    },
+};
+
+AtomicType_: Type<Id, AstType<Id>> = {
+    "(" "->" ")" =>
+        Type::Builtin(BuiltinType::Function),
+
+    <ids: (<IdentStr> ".")*> <last: IdentStr> => {
+        if ids.is_empty() {
+            if last == "_" {
+                Type::Hole
+            } else {
+                match BuiltinType::from_str(last) {
+                    Ok(ty) => Type::Builtin(ty),
+                    Err(_) if last.starts_with(char::is_uppercase) => {
+                        Type::Ident(env.from_str(last))
+                    }
+                    Err(_) => {
+                        Type::Generic(Generic::new(env.from_str(last), Kind::hole()))
+                    }
+                }
+            }
+        } else {
+            let project_id: String = ids
+                .iter()
+                .cloned()
+                .chain(Some(last))
+                .intersperse(".")
+                .collect();
+            Type::Ident(env.from_str(&project_id))
+        }
+    },
+
+    "(" <elems: Comma<Type>> ")" =>
+        match elems.len() {
+            // Parenthesized type
+            1 => elems.into_iter().next().unwrap().into_inner(),
+            _ => Type::tuple_(env, elems),
+        },
+
+    "{" <row: Comma<RecordField>> "}" =>
+        Type::Record(Type::extend_row(
+            vec![],
+            row,
+            Type::empty_row(),
+        )),
+};
+
+AtomicType : AstType<Id> = {
+    <typ: Sp<AtomicType_>> => AstType::from(typ),
+};
+
+AppType_ = {
+    AtomicType_,
+
+    <ty: AtomicType> <args: AtomicType+> =>
+        Type::App(ty, args.into_iter().collect()),
+};
+
+AppType : AstType<Id> = {
+    <typ: Sp<AppType_>> => AstType::from(typ),
+};
+
+Type_ = {
+    AppType_,
+    "forall" <args: Ident+> "." <ty: Type> =>
+        Type::Forall(args.into_iter()
+                         .map(|id| Generic::new(id, Kind::variable(0)))
+                         .collect(),
+                     ty,
+                     None),
+
+    <lhs: ArgType> <f: Sp<"->">> <rhs: Type> =>
+        Type::Function(
+            lhs.0,
+            lhs.1,
+            rhs,
+        )
+};
+
+Type : AstType<Id> = {
+    <typ: Sp<Type_>> => AstType::from(typ),
+};
+
+ArgType: (ArgType, AstType<Id>) = {
+    <AppType> => (ArgType::Explicit, <>),
+    "[" <Type> "]" => (ArgType::Implicit, <>),
+};
+
+// Patterns
+
+FieldPattern : FieldPattern<Id> = {
+    <id: Sp<Ident>> "=" <body: Sp<Pattern>> =>
+        FieldPattern::Value(id, Some(body)),
+
+    <Sp<IdentStr>> => {
+        let id = pos::spanned(<>.span, env.from_str(<>.value));
+        if <>.value.starts_with(char::is_uppercase) {
+            FieldPattern::Type(id, None)
+        } else {
+            FieldPattern::Value(id, None)
+        }
+    },
+};
+
+AtomicPattern: Pattern<Id> = {
+    <id: Ident> "@" <pat: Sp<AtomicPattern>> =>
+        Pattern::As(id, Box::new(pat)),
+
+    <id: Ident> =>
+        if env.string(&id).starts_with(char::is_uppercase) {
+            Pattern::Constructor(new_ident(type_cache, id), Vec::new())
+        } else {
+            Pattern::Ident(new_ident(type_cache, id))
+        },
+
+    <l: Literal> =>
+        Pattern::Literal(l),
+
+    "(" <elems: Comma<Sp<Pattern>>> ")" =>
+        match elems.len() {
+            // Parenthesized pattern
+            1 => elems.into_iter().next().unwrap().value,
+            _ => Pattern::Tuple { typ: Type::hole(), elems: elems },
+        },
+
+    "{" <fields: Comma<FieldPattern>> <implicit_import: Sp<"?"?>> "}" => {
+        let mut types = Vec::new();
+        let mut values = Vec::new();
+
+        for field in fields {
+            match field {
+                FieldPattern::Type(id, typ) => types.push(PatternField {
+                    name: id,
+                    value: typ
+                }),
+                FieldPattern::Value(id, field) => values.push(PatternField {
+                    name: id,
+                    value: field
+                }),
+            }
+        }
+
+        let implicit_import_span = implicit_import.span;
+
+        Pattern::Record {
+            typ: Type::hole(),
+            types: types,
+            fields: values,
+            implicit_import: implicit_import
+                .value
+                .map(|_| pos::spanned(implicit_import_span, env.from_str(&format!("implicit?{}", implicit_import_span.start)))),
+        }
+    },
+};
+
+NoErrorPattern = {
+    AtomicPattern,
+
+    <id: Ident> <args: Sp<AtomicPattern>+> => {
+        let id = new_ident(type_cache, id);
+
+        Pattern::Constructor(id, args)
+    },
+};
+
+Pattern = {
+    NoErrorPattern,
+    <!> => {
+        errors.push(<>.error);
+        Pattern::Error
+    },
+};
+
+// Expressions
+
+Literal: Literal = {
+    "string literal" => Literal::String(<>),
+    "char literal" => Literal::Char(<>),
+    "int literal" => Literal::Int(<>),
+    "byte literal" => Literal::Byte(<>),
+    "float literal" => Literal::Float(NotNaN::new(<>).unwrap()),
+};
+
+Alternative: Alternative<Id> = {
+    "|" <pat: Sp<Pattern>> "->" <expr: Sp<BlockExpr>> => {
+        Alternative {
+            pattern: pat,
+            expr: super::shrink_hidden_spans(expr),
+        }
+    },
+    "|" <pat: Sp<NoErrorPattern>> <err: !> <end: @R>  => {
+        errors.push(err.error);
+        let span = pos::Span::new(pat.span.end, end);
+        Alternative {
+            pattern: pat,
+            expr: pos::spanned(span, Expr::Error(None)),
+        }
+    },
+    "|" <start: @R> <err: !> <end: @R>  => {
+        errors.push(err.error);
+        let span = pos::Span::new(start, end);
+        Alternative {
+            pattern: pos::spanned(span, Pattern::Error),
+            expr: pos::spanned(span, Expr::Error(None)),
+        }
+    },
+};
+
+FieldExpr: FieldExpr<Id> = {
+    <comment: DocComment?> <id: Sp<Ident>> "=" <body: SpExpr> => {
+        FieldExpr::Value(comment, id, Some(body))
+    },
+
+    <comment: DocComment?> <id_str: Sp<IdentStr>> => {
+        let id = pos::spanned(id_str.span, env.from_str(id_str.value));
+        if id_str.value.starts_with(char::is_uppercase) {
+            FieldExpr::Type(comment, id, None)
+        } else {
+            FieldExpr::Value(comment, id, None)
+        }
+    },
+};
+
+ValueArgument: Argument<Id> = {
+    <arg_type: "?"?> <name: SpannedIdent> => {
+        Argument {
+            arg_type: if arg_type.is_some() {
+                ArgType::Implicit
+            } else {
+                ArgType::Explicit
+            },
+            name,
+        }
+    }
+};
+
+ValueBinding: ValueBinding<Id> = {
+    <comment: DocComment?> <name: Sp<AtomicPattern>> <typ: (":" <Type>)?> "=" <body: SpExpr> =>
+        ValueBinding {
+            comment: comment,
+            name: name,
+            typ: typ,
+            resolved_type: type_cache.hole(),
+            args: vec![],
+            expr: body,
+        },
+
+    <comment: DocComment?> <name: Sp<Ident>> <args: ValueArgument+> <typ: (":" <Type>)?> "=" <body: SpExpr> =>
+        ValueBinding {
+            comment,
+            name: name.map(|name| new_ident(type_cache, name)).map(Pattern::Ident),
+            typ: typ,
+            resolved_type: type_cache.hole(),
+            args,
+            expr: body,
+        },
+};
+
+RecordExprBase: Option<SpannedExpr<Id>> = {
+    ".." <SpExpr> => Some(<>),
+    => None
+};
+
+AtomicExpr: Expr<Id> = {
+    <id: Ident> =>
+        Expr::Ident(new_ident(type_cache, id)),
+
+    <lit: Literal> =>
+        Expr::Literal(lit),
+
+    // TODO: Getters
+    // "(" "." <id: Ident> ")" =>
+    //     Expr::Getter(id),
+
+    <expr: SpAtomicExpr> "." <id: Ident> =>
+        Expr::Projection(Box::new(expr), id, Type::hole()),
+
+    <expr: SpAtomicExpr> "." <err: !> => {
+        errors.push(err.error);
+        Expr::Projection(Box::new(expr), env.from_str(""), Type::hole())
+    },
+
+    "(" <elems: Comma<SpExpr>> ")" =>
+        Expr::Tuple { typ: Type::hole(), elems: elems },
+
+    "[" <elems: Comma<SpExpr>> "]" => Expr::Array(Array {
+            typ: Type::hole(),
+            exprs: elems,
+        }),
+
+    "{" <fields: Comma<FieldExpr>> <base: RecordExprBase> "}" => {
+        let mut types = Vec::new();
+        let mut values = Vec::new();
+
+        for field in fields {
+            match field {
+                FieldExpr::Type(comment, id, typ) => types.push(ExprField {
+                    comment: comment,
+                    name: id,
+                    value: typ
+                }),
+                FieldExpr::Value(comment, id, expr) => values.push(ExprField {
+                    comment: comment,
+                    name: id,
+                    value: expr
+                }),
+            }
+        }
+
+        Expr::Record {
+            typ: Type::hole(),
+            types: types,
+            exprs: values,
+            base: base.map(Box::new),
+        }
+    },
+};
+
+SpAtomicExpr: SpannedExpr<Id> = {
+    <Sp<AtomicExpr>> => super::shrink_hidden_spans(<>)
+};
+
+ImplicitArg: SpannedExpr<Id> = {
+    "?" <arg: Sp<AtomicExpr>> => arg
+};
+
+AppExpr = {
+    AtomicExpr,
+
+    <expr: SpAtomicExpr> <implicit_args: ImplicitArg+> =>
+        Expr::App { func: Box::new(expr), implicit_args, args: Vec::new() },
+
+    <expr: SpAtomicExpr> <implicit_args: ImplicitArg*> <args: SpAtomicExpr+> =>
+        Expr::App { func: Box::new(expr), implicit_args, args },
+};
+
+
+LambdaArgument: Argument<Id> = {
+    <name: SpannedIdent> => {
+        Argument::explicit(name)
+    }
+};
+
+InfixExpr = {
+    AppExpr,
+
+    "\\" <args: LambdaArgument+> "->" <body: SpExpr> =>
+        Expr::Lambda(Lambda {
+            id: new_ident(type_cache, env.from_str("")),
+            args,
+            body: Box::new(body),
+        }),
+
+    <lhs: Sp<AppExpr>> <op: Sp<Operator>> <rhs: Sp<InfixExpr>> =>
+        Expr::Infix { lhs: Box::new(lhs), op, rhs: Box::new(super::shrink_hidden_spans(rhs)), implicit_args: Vec::new(), },
+};
+
+AndValueBinding: ValueBinding<Id> =
+    <comment: DocComment?> "and" <binding: ValueBinding> => {
+        let mut binding = binding;
+        binding.comment = comment;
+        binding
+    };
+
+AndTypeBinding: TypeBinding<Id> =
+    <comment: DocComment?> "and" <binding: TypeBinding> => {
+        let mut binding = binding;
+        binding.comment = comment;
+        binding
+    };
+
+Expr: Expr<Id> = {
+    InfixExpr,
+
+    "if" <pred: SpExpr> "then" <if_true: SpExpr> "else" <if_false: SpExpr> =>
+        Expr::IfElse(Box::new(pred), Box::new(if_true), Box::new(if_false)),
+
+    "match" <input: SpExpr> "with" <arms: Alternative+> =>
+        Expr::Match(Box::new(input), arms),
+
+    <comment: DocComment?> "let" <first: ValueBinding> <bindings: AndValueBinding*> SkipExtraTokens "in" <body: SpExpr> => {
+        let mut first = first;
+        let mut bindings = bindings;
+        first.comment = comment;
+        bindings.insert(0, first);
+
+        Expr::LetBindings(bindings, Box::new(body))
+    },
+
+    <comment: DocComment?> "type" <first: TypeBinding> <bindings: AndTypeBinding*> SkipExtraTokens "in" <body: SpExpr> => {
+        let mut first = first;
+        let mut bindings = bindings;
+        first.comment = comment;
+        bindings.insert(0, first);
+
+        Expr::TypeBindings(bindings, Box::new(body))
+    },
+
+    "do" <id: SpannedIdent> "=" <bound: SpExpr> "in" <body: SpExpr> => {
+        Expr::Do(Do { id, bound: Box::new(bound), body: Box::new(body), flat_map_id: None })
+    },
+
+    BlockExpr,
+
+    ! => {
+        errors.push(<>.error);
+        Expr::Error(None)
+    }
+};
+
+BlockExpr: Expr<Id> = {
+    "block open" <exprs: (<SpExpr> "block separator")*> <last: SpExpr> "block close" => {
+        let mut exprs = exprs;
+        exprs.push(last);
+        Expr::Block(exprs)
+    },
+};
+
+SpExpr: SpannedExpr<Id> = {
+    <expr: Sp<Expr>> => super::shrink_hidden_spans(expr),
+};
+
+pub TopExpr: SpannedExpr<Id> = {
+    "shebang line"? <expr: SpExpr> SkipExtraTokens => expr,
+};
+
+pub LetOrExpr: Result<SpannedExpr<Id>, ValueBinding<Id>> = {
+    <TopExpr> => Ok(<>),
+    "block open" "let" <ValueBinding> SkipExtraTokens
+        // Ugh but I just need the parser to be happy for now
+        "in" "block close" "block close" "block open" "block open" => Err(<>)
+};
